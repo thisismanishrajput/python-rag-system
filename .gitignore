@@ -1,0 +1,20 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+
+# Environment variables
+.env
+
+# ChromaDB persistent storage
+chroma_store/
+
+# VSCode settings (optional, if you're using it)
+.vscode/
+
+# macOS system files
+.DS_Store
