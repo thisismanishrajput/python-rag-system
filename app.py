@@ -1,5 +1,12 @@
 from flask import Flask, request, jsonify
-from rag_utils import search_products, sync_products_to_chroma
+from rag_utils import (
+    search_products_improved, 
+    sync_products_to_chroma, 
+    sync_single_product,
+    delete_product_from_chroma,
+    fallback_search,
+    get_search_stats
+)
 from openai import OpenAI
 import google.generativeai as genai
 from pymongo import MongoClient
@@ -7,6 +14,8 @@ import os
 from flask_cors import CORS
 from dotenv import load_dotenv
 from bson import ObjectId
+import traceback
+import math
 
 # 🔐 Load env variables
 load_dotenv()
@@ -46,62 +55,20 @@ def serialize_product(product):
     
     return product
 
-@app.route('/search', methods=['POST'])
-def ai_search():
-    try:
-        user_query = request.json['query']
-        agent = request.json.get('agent', 'openai')
-        
-        print(f"🔍 Search request: '{user_query}' using {agent}")
+def generate_ai_response(query: str, products: list, agent: str = "openai") -> str:
+    """Generate AI response based on products found"""
+    if not products:
+        return f"Sorry, we don't currently have any products related to \"{query}\"."
+    
+    # Create product summaries
+    product_summaries = "\n".join([
+        f"- {p['name']} ({p.get('brand', 'No Brand')}): {p.get('description', '')[:100]}..."
+        for p in products[:5]  # Limit to top 5 for prompt
+    ])
 
-        # Vector search
-        products, hits_meta = search_products(user_query)
-        used_fallback = False
-
-        print(f"🎯 Vector search found {len(products)} products")
-
-        # Fallback: Mongo keyword search (only if vector search fails)
-        if not products:
-            print("🔄 Trying MongoDB fallback search...")
-            fallback_products = list(product_collection.find({
-                "$or": [
-                    {"brand": {"$regex": user_query, "$options": "i"}},
-                    {"name": {"$regex": user_query, "$options": "i"}},
-                    {"description": {"$regex": user_query, "$options": "i"}},
-                    {"tags": {"$elemMatch": {"$regex": user_query, "$options": "i"}}},
-                    {"gender": {"$regex": user_query, "$options": "i"}}
-                ]
-            }))
-            print(f"📦 MongoDB fallback found {len(fallback_products)} products")
-            
-            if fallback_products:
-                products = fallback_products
-                hits_meta = [{"product_id": str(p["_id"]), "distance": 0.0} for p in fallback_products]
-                used_fallback = True
-
-        # ❌ No products at all
-        if not products:
-            print("❌ No products found, returning suggestions")
-            suggested_products = list(product_collection.find().limit(3))
-            return jsonify({
-                "products": [],
-                "results": [],
-                "ai_response": f"Sorry, we don't currently have any products related to \"{user_query}\".",
-                "agent_used": agent,
-                "suggestions": [serialize_product(p) for p in suggested_products],
-                "used_fallback": used_fallback
-            })
-
-        # ✅ Product summary for prompt
-        limited_products = products[:5]
-        product_summaries = "\n".join([
-            f"- {p['name']} ({p.get('brand', 'No Brand')}): {p.get('description', '')[:100]}..."
-            for p in limited_products
-        ])
-
-        prompt = f"""
+    prompt = f"""
 You are a smart shopping assistant for an e-commerce store.
-User asked: "{user_query}"
+User asked: "{query}"
 
 Here are the available products that match their query:
 {product_summaries}
@@ -110,50 +77,108 @@ Provide a helpful response recommending these products. Be enthusiastic and ment
 
 If the products don't seem relevant to their query, say:
 "Sorry, we don't have exactly what you're looking for, but here are some similar products that might interest you."
+
+Keep the response concise and engaging (max 200 words).
 """
 
-        # 🤖 Generate AI response
-        ai_reply = ""
+    try:
         if agent == 'gemini':
             model = genai.GenerativeModel("models/gemini-1.5-flash")
             response = model.generate_content(prompt)
-            ai_reply = response.text.strip()
+            return response.text.strip()
         else:  # default OpenAI
             response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=300
             )
-            ai_reply = response.choices[0].message.content.strip()
+            return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"❌ AI response error: {e}")
+        return f"Here are some products that match your search for '{query}'."
 
-        if not ai_reply:
-            ai_reply = f"Here are some products that match your search for '{user_query}'."
+@app.route('/search', methods=['POST'])
+def ai_search():
+    """Enhanced search endpoint with pagination and filtering"""
+    try:
+        data = request.json
+        user_query = data.get('query', '')
+        agent = data.get('agent', 'openai')
+        page = data.get('page', 1)
+        limit = data.get('limit', 10)
+        filters = data.get('filters', {})
+        max_distance = data.get('max_distance', 1.2)
+        
+        if not user_query:
+            return jsonify({"error": "Query is required"}), 400
+        
+        print(f"🔍 Search request: '{user_query}' using {agent} (page {page}, limit {limit})")
+        print(f"🔍 Filters: {filters}")
 
-        print(f"✅ Returning {len(products)} products with AI response")
+        # Enhanced vector search
+        products, hits_meta, total_count = search_products_improved(
+            query=user_query,
+            top_k=limit * 2,  # Get more results for better ranking
+            page=page,
+            limit=limit,
+            filters=filters,
+            max_distance=max_distance
+        )
+        
+        used_fallback = False
+        
+        # Fallback to MongoDB search if vector search fails
+        if not products:
+            print("🔄 Trying MongoDB fallback search...")
+            products, total_count = fallback_search(
+                query=user_query,
+                filters=filters,
+                page=page,
+                limit=limit
+            )
+            used_fallback = True
+
+        # Generate AI response
+        ai_response = generate_ai_response(user_query, products, agent)
+        
+        # Calculate pagination info
+        total_pages = math.ceil(total_count / limit) if total_count > 0 else 0
+        
+        print(f"✅ Returning {len(products)} products (page {page}/{total_pages})")
 
         return jsonify({
             "products": [serialize_product(p) for p in products],
-            "results": hits_meta,
-            "ai_response": ai_reply,
+            "hits_meta": hits_meta,
+            "ai_response": ai_response,
             "agent_used": agent,
             "used_fallback": used_fallback,
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "total": total_count,
+                "total_pages": total_pages,
+                "has_next": page < total_pages,
+                "has_prev": page > 1
+            },
+            "filters_applied": filters,
             "debug": {
                 "original_query": user_query,
                 "products_found": len(products),
-                "vector_search_worked": len(products) > 0 and not used_fallback
+                "vector_search_worked": len(products) > 0 and not used_fallback,
+                "max_distance": max_distance
             }
         })
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         print(f"❌ Error in ai_search: {e}")
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @app.route('/sync', methods=['POST'])
 def sync():
+    """Full sync endpoint"""
     try:
-        print("🔄 Starting sync...")
+        print("🔄 Starting full sync...")
         sync_products_to_chroma()
         
         # Test search after sync
@@ -161,39 +186,126 @@ def sync():
         print("\n🧪 Testing search after sync:")
         test_search("lip balm")
         
-        return jsonify({"message": "Synced successfully!"})
+        return jsonify({"message": "Full sync completed successfully!"})
     except Exception as e:
         print(f"❌ Sync error: {e}")
-        import traceback
         traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/sync-product', methods=['POST'])
+def sync_single():
+    """Sync a single product endpoint"""
+    try:
+        data = request.json
+        product_id = data.get('product_id')
+        
+        if not product_id:
+            return jsonify({"error": "product_id is required"}), 400
+        
+        print(f"🔄 Syncing single product: {product_id}")
+        success = sync_single_product(product_id)
+        
+        if success:
+            return jsonify({"message": "Product synced successfully!", "product_id": product_id})
+        else:
+            return jsonify({"error": "Failed to sync product"}), 500
+            
+    except Exception as e:
+        print(f"❌ Single sync error: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/delete-product', methods=['POST'])
+def delete_product():
+    """Delete a product from ChromaDB"""
+    try:
+        data = request.json
+        product_id = data.get('product_id')
+        
+        if not product_id:
+            return jsonify({"error": "product_id is required"}), 400
+        
+        print(f"🗑️ Deleting product from ChromaDB: {product_id}")
+        success = delete_product_from_chroma(product_id)
+        
+        if success:
+            return jsonify({"message": "Product deleted successfully!", "product_id": product_id})
+        else:
+            return jsonify({"error": "Failed to delete product"}), 500
+            
+    except Exception as e:
+        print(f"❌ Delete error: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/stats', methods=['GET'])
+def get_stats():
+    """Get system statistics"""
+    try:
+        stats = get_search_stats()
+        return jsonify(stats)
+    except Exception as e:
+        print(f"❌ Stats error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/test', methods=["GET"])
 def test():
-    return "✅ Flask is working with OpenAI, Gemini, and ChromaDB!"
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "message": "Flask RAG system is working with OpenAI, Gemini, and ChromaDB!",
+        "features": [
+            "Enhanced vector search with ranking",
+            "Pagination support",
+            "Filtering capabilities",
+            "Incremental sync",
+            "Fallback search",
+            "AI response generation"
+        ]
+    })
 
 @app.route('/debug', methods=["POST"])
 def debug_search():
     """Debug endpoint to test search functionality"""
     try:
-        query = request.json.get('query', 'lip balm')
-        print(f"\n🐛 Debug search for: '{query}'")
+        data = request.json
+        query = data.get('query', 'lip balm')
+        filters = data.get('filters', {})
         
-        # Import test function
-        from rag_utils import test_search
-        products, hits_meta = test_search(query)
+        print(f"\n🐛 Debug search for: '{query}' with filters: {filters}")
+        
+        # Test enhanced search
+        products, hits_meta, total = search_products_improved(
+            query=query,
+            top_k=5,
+            page=1,
+            limit=5,
+            filters=filters
+        )
         
         return jsonify({
             "query": query,
+            "filters": filters,
             "products_found": len(products),
+            "total_available": total,
             "products": [serialize_product(p) for p in products],
-            "hits_meta": hits_meta
+            "hits_meta": hits_meta,
+            "stats": get_search_stats()
         })
     except Exception as e:
-        import traceback
+        print(f"❌ Debug error: {e}")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    print("🚀 Starting Flask app...")
+    print("🚀 Starting enhanced Flask RAG app...")
+    print("📋 Available endpoints:")
+    print("  POST /search - Enhanced search with pagination and filtering")
+    print("  POST /sync - Full sync all products")
+    print("  POST /sync-product - Sync single product")
+    print("  POST /delete-product - Delete product from ChromaDB")
+    print("  GET /stats - System statistics")
+    print("  GET /test - Health check")
+    print("  POST /debug - Debug search functionality")
+    
     app.run(port=5050, debug=True)
